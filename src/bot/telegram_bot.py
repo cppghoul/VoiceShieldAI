@@ -234,7 +234,11 @@ async def handle_private_bot_chat(session: aiohttp.ClientSession, message: dict[
     voice = message.get("voice") or message.get("audio")
 
     if text in {"/start", BTN_CHECK_TEXT, BTN_CHECK_VOICE, BTN_HELP_CONNECT}:
-        if text in {"/start", BTN_CHECK_TEXT}:
+        if text == "/start":
+            WAITING_FOR_TEXT_FROM_CHAT.discard(chat_id)
+            await send_message(session, chat_id, MENU_TEXT, reply_markup=build_main_keyboard())
+            return
+        if text == BTN_CHECK_TEXT:
             WAITING_FOR_TEXT_FROM_CHAT.add(chat_id)
             await send_message(session, chat_id, "Отправьте текст для проверки.", reply_markup=build_main_keyboard())
             return
