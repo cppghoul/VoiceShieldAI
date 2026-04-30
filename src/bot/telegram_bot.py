@@ -266,16 +266,25 @@ async def handle_group_message(session: aiohttp.ClientSession, message: dict[str
         return
 
     text = (message.get("text") or "").strip()
-    if text == BTN_GROUP_ON_HERE:
+    if text in {BTN_GROUP_ON_HERE, BTN_GROUP_ON}:
         ENABLED_GROUP_CHATS.add(chat_id)
         await send_message(session, chat_id, "Проверка скама включена для этой группы.", reply_markup=group_keyboard())
         return
-    if text == BTN_GROUP_OFF_HERE:
+    if text in {BTN_GROUP_OFF_HERE, BTN_GROUP_OFF}:
         ENABLED_GROUP_CHATS.discard(chat_id)
         await send_message(session, chat_id, "Проверка скама выключена для этой группы.", reply_markup=group_keyboard())
         return
 
     if chat_id not in ENABLED_GROUP_CHATS:
+        entities = message.get("entities") or []
+        is_mention = any(e.get("type") == "mention" for e in entities)
+        if is_mention or message.get("reply_to_message"):
+            await send_message(
+                session,
+                chat_id,
+                "Чтобы включить проверку в этой группе, отправьте: <b>✅ Включить проверку здесь</b>",
+                reply_markup=group_keyboard(),
+            )
         return
 
     source_label = chat.get("title") or f"group_id={chat_id}"
