@@ -25,6 +25,26 @@ BASE_DIR = Path(__file__).resolve().parent.parent.parent
 SCAM_TEMPLATES_PATH = BASE_DIR / "data" / "scam_calls" / "scam.txt"
 SAFE_TEMPLATES_PATH = BASE_DIR / "data" / "scam_calls" / "not_scam.txt"
 
+MENU_TEXT = (
+    "🛡 VoiceShield готов к проверке.\n"
+    "Выберите действие кнопками ниже:\n"
+    "• Проверить текст\n"
+    "• Проверить голосовое\n"
+    "• Включить/выключить проверку сообщений в группе"
+)
+BTN_CHECK_TEXT = "🔎 Проверить текст"
+BTN_CHECK_VOICE = "🎙 Проверить голосовое"
+BTN_GROUP_ON = "✅ Включить проверку в группе"
+BTN_GROUP_OFF = "⛔ Выключить проверку в группе"
+BTN_HELP_CONNECT = "ℹ️ Как подключить"
+BTN_GROUP_ON_HERE = "✅ Включить проверку здесь"
+BTN_GROUP_OFF_HERE = "⛔ Выключить проверку здесь"
+
+GROUP_SCAN_ENABLED_USERS: set[int] = set()
+ENABLED_GROUP_CHATS: set[int] = set()
+WAITING_FOR_TEXT_FROM_CHAT: set[int] = set()
+BUSINESS_ALERT_CHAT_CACHE: dict[str, int] = {}
+
 
 def load_templates(path: Path) -> list[str]:
     if not path.exists():
@@ -34,7 +54,6 @@ def load_templates(path: Path) -> list[str]:
 
 SCAM_TEMPLATES = load_templates(SCAM_TEMPLATES_PATH)
 SAFE_TEMPLATES = load_templates(SAFE_TEMPLATES_PATH)
-BUSINESS_ALERT_CHAT_CACHE: dict[str, int] = {}
 
 
 def boost_risk_with_rules(text: str, base_prob: float) -> float:
@@ -62,6 +81,15 @@ def format_alert_message(source_label: str, original_text: str, risk: float) -> 
     )
 
 
+def build_main_keyboard() -> dict[str, Any]:
+    return {
+        "keyboard": [
+            [{"text": BTN_CHECK_TEXT}, {"text": BTN_CHECK_VOICE}],
+            [{"text": BTN_GROUP_ON}, {"text": BTN_GROUP_OFF}],
+            [{"text": BTN_HELP_CONNECT}],
+        ],
+        "resize_keyboard": True,
+    }
 
 
 async def tg_api(session: aiohttp.ClientSession, method: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -78,12 +106,15 @@ async def send_message(
     text: str,
     business_connection_id: str | None = None,
     parse_mode: str | None = "HTML",
+    reply_markup: dict[str, Any] | None = None,
 ) -> None:
     payload: dict[str, Any] = {"chat_id": chat_id, "text": text}
     if parse_mode:
         payload["parse_mode"] = parse_mode
     if business_connection_id:
         payload["business_connection_id"] = business_connection_id
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
     await tg_api(session, "sendMessage", payload)
 
 
@@ -119,11 +150,7 @@ async def process_text(text: str) -> float:
     return boost_risk_with_rules(text, prob)
 
 
-async def process_voice(
-    session: aiohttp.ClientSession,
-    file_id: str,
-    local_prefix: str,
-) -> tuple[str, float, float, float]:
+async def process_voice(session: aiohttp.ClientSession, file_id: str, local_prefix: str) -> tuple[str, float, float, float]:
     local_path = await download_voice(session, file_id, local_prefix)
     try:
         text = transcribe_audio(local_path)
@@ -142,15 +169,136 @@ async def process_voice(
             os.remove(local_path)
 
 
+async def analyze_and_respond_text(session: aiohttp.ClientSession, chat_id: int, source_label: str, text: str) -> None:
+    risk = await process_text(text)
+    status = "⚠️ Высокий риск" if is_dangerous(risk) else "✅ Явных признаков скама мало"
+    await send_message(
+        session,
+        chat_id,
+        f"{status}\nИсточник: <b>{html.escape(source_label)}</b>\nРиск: <b>{risk * 100:.1f}%</b>",
+    )
+
+
+async def analyze_and_respond_voice(session: aiohttp.ClientSession, chat_id: int, source_label: str, file_id: str, prefix: str) -> None:
+    transcript, final_prob, text_prob, audio_prob = await process_voice(session, file_id, prefix)
+    status = "⚠️ Высокий риск" if is_dangerous(final_prob) else "✅ Явных признаков скама мало"
+    await send_message(
+        session,
+        chat_id,
+        (
+            f"{status}\nИсточник: <b>{html.escape(source_label)}</b>\n"
+            f"Риск: <b>{final_prob * 100:.1f}%</b>\n"
+            f"📊 Текст: {text_prob * 100:.1f}%\n"
+            f"🎙 Аудио: {audio_prob * 100:.1f}%\n\n"
+            f"🧾 Расшифровка:\n<i>{html.escape(transcript or '[пусто]')}</i>"
+        ),
+    )
+
+
+
+
+def connection_help_text() -> str:
+    return (
+        "<b>Как подключить бота</b>\n\n"
+        "<b>1) Личный чат:</b> откройте диалог с ботом и используйте кнопки проверки текста/голоса.\n\n"
+        "<b>2) Проверка в группе:</b>\n"
+        "• Добавьте бота в нужную группу.\n"
+        "• Дайте право читать сообщения (отключите Privacy Mode в BotFather, если нужно).\n"
+        "• В группе отправьте кнопку/текст: <i>✅ Включить проверку здесь</i>.\n"
+        "• Для остановки: <i>⛔ Выключить проверку здесь</i>.\n\n"
+        "<b>3) Business-режим:</b> подключите Telegram Business к этому боту. "
+        "Тогда опасные сообщения из business-чатов будут приходить в ваш личный чат с ботом."
+    )
+
+
+def group_keyboard() -> dict[str, Any]:
+    return {
+        "keyboard": [
+            [{"text": BTN_GROUP_ON_HERE}, {"text": BTN_GROUP_OFF_HERE}],
+        ],
+        "resize_keyboard": True,
+    }
 async def handle_private_bot_chat(session: aiohttp.ClientSession, message: dict[str, Any]) -> None:
     chat_id = message["chat"]["id"]
     text = (message.get("text") or "").strip()
-    if text == "/start":
-        await send_message(
-            session,
-            chat_id,
-            "🛡 VoiceShield подключен.\nБот отслеживает сообщения в Telegram Business и присылает сюда только опасные кейсы.",
-        )
+    voice = message.get("voice") or message.get("audio")
+
+    if text in {"/start", BTN_CHECK_TEXT, BTN_CHECK_VOICE, BTN_GROUP_ON, BTN_GROUP_OFF, BTN_HELP_CONNECT}:
+        if text in {"/start", BTN_CHECK_TEXT}:
+            WAITING_FOR_TEXT_FROM_CHAT.add(chat_id)
+            await send_message(session, chat_id, "Отправьте текст для проверки.", reply_markup=build_main_keyboard())
+            return
+        if text == BTN_CHECK_VOICE:
+            await send_message(session, chat_id, "Отправьте голосовое сообщение для проверки.", reply_markup=build_main_keyboard())
+            return
+        if text == BTN_GROUP_ON:
+            GROUP_SCAN_ENABLED_USERS.add(chat_id)
+            await send_message(session, chat_id, "Проверка сообщений в группах включена.", reply_markup=build_main_keyboard())
+            return
+        if text == BTN_GROUP_OFF:
+            GROUP_SCAN_ENABLED_USERS.discard(chat_id)
+            await send_message(session, chat_id, "Глобальный режим проверки групп выключен. Для точной настройки используйте кнопки внутри группы.", reply_markup=build_main_keyboard())
+            return
+        if text == BTN_HELP_CONNECT:
+            await send_message(session, chat_id, connection_help_text(), reply_markup=build_main_keyboard())
+            return
+
+    if text and chat_id in WAITING_FOR_TEXT_FROM_CHAT:
+        WAITING_FOR_TEXT_FROM_CHAT.discard(chat_id)
+        await analyze_and_respond_text(session, chat_id, "Личный чат", text)
+        return
+
+    if voice and voice.get("file_id"):
+        try:
+            await analyze_and_respond_voice(session, chat_id, "Личный чат", voice["file_id"], "temp_private_voice")
+        except Exception as exc:
+            print(f"Private voice processing failed: {exc}")
+            await send_message(session, chat_id, "❌ Не удалось обработать голосовое сообщение.")
+        return
+
+    await send_message(session, chat_id, MENU_TEXT, reply_markup=build_main_keyboard())
+
+
+async def handle_group_message(session: aiohttp.ClientSession, message: dict[str, Any]) -> None:
+    chat = message.get("chat", {})
+    chat_id = chat.get("id")
+    if not chat_id:
+        return
+
+    text = (message.get("text") or "").strip()
+    if text in {BTN_GROUP_ON_HERE, BTN_GROUP_ON}:
+        ENABLED_GROUP_CHATS.add(chat_id)
+        await send_message(session, chat_id, "Проверка скама включена для этой группы.", reply_markup=group_keyboard())
+        return
+    if text in {BTN_GROUP_OFF_HERE, BTN_GROUP_OFF}:
+        ENABLED_GROUP_CHATS.discard(chat_id)
+        await send_message(session, chat_id, "Проверка скама выключена для этой группы.", reply_markup=group_keyboard())
+        return
+
+    if chat_id not in ENABLED_GROUP_CHATS:
+        entities = message.get("entities") or []
+        is_mention = any(e.get("type") == "mention" for e in entities)
+        if is_mention or message.get("reply_to_message"):
+            await send_message(
+                session,
+                chat_id,
+                "Чтобы включить проверку в этой группе, отправьте: <b>✅ Включить проверку здесь</b>",
+                reply_markup=group_keyboard(),
+            )
+        return
+
+    source_label = chat.get("title") or f"group_id={chat_id}"
+    if text:
+        await analyze_and_respond_text(session, chat_id, source_label, text)
+        return
+
+    voice = message.get("voice") or message.get("audio")
+    if voice and voice.get("file_id"):
+        try:
+            await analyze_and_respond_voice(session, chat_id, source_label, voice["file_id"], "temp_group_voice")
+        except Exception as exc:
+            print(f"Group voice processing failed: {exc}")
+            await send_message(session, chat_id, "❌ Не удалось обработать голосовое сообщение в группе.")
 
 
 async def handle_business_update(session: aiohttp.ClientSession, business_message: dict[str, Any]) -> None:
@@ -174,18 +322,10 @@ async def handle_business_update(session: aiohttp.ClientSession, business_messag
     voice = business_message.get("voice") or business_message.get("audio")
     if voice and voice.get("file_id"):
         try:
-            transcript, final_prob, text_prob, audio_prob = await process_voice(
-                session,
-                voice["file_id"],
-                "temp_business_voice",
-            )
+            transcript, final_prob, text_prob, audio_prob = await process_voice(session, voice["file_id"], "temp_business_voice")
         except Exception as exc:
             print(f"Voice processing failed: {exc}")
-            await send_message(
-                session,
-                alert_chat_id,
-                "❌ Не удалось обработать голосовое сообщение. Проверьте установку ffmpeg и доступность аудиокодеков.",
-            )
+            await send_message(session, alert_chat_id, "❌ Не удалось обработать голосовое сообщение. Проверьте установку ffmpeg и доступность аудиокодеков.")
             return
         if is_dangerous(final_prob):
             alert = (
@@ -199,8 +339,12 @@ async def handle_business_update(session: aiohttp.ClientSession, business_messag
 
 async def handle_update(session: aiohttp.ClientSession, update: dict[str, Any]) -> None:
     message = update.get("message")
-    if message and message.get("chat", {}).get("type") == "private":
-        await handle_private_bot_chat(session, message)
+    if message:
+        chat_type = message.get("chat", {}).get("type")
+        if chat_type == "private":
+            await handle_private_bot_chat(session, message)
+        elif chat_type in {"group", "supergroup"}:
+            await handle_group_message(session, message)
     business_message = update.get("business_message") or update.get("edited_business_message")
     if business_message:
         await handle_business_update(session, business_message)
@@ -217,15 +361,7 @@ async def polling_loop() -> None:
     async with aiohttp.ClientSession(timeout=timeout) as session:
         while True:
             try:
-                updates = await tg_api(
-                    session,
-                    "getUpdates",
-                    {
-                        "offset": offset,
-                        "timeout": 60,
-                        "allowed_updates": allowed_updates,
-                    },
-                )
+                updates = await tg_api(session, "getUpdates", {"offset": offset, "timeout": 60, "allowed_updates": allowed_updates})
                 for item in updates:
                     offset = item["update_id"] + 1
                     await handle_update(session, item)
