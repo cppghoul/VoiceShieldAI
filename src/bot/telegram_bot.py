@@ -36,8 +36,12 @@ BTN_CHECK_TEXT = "🔎 Проверить текст"
 BTN_CHECK_VOICE = "🎙 Проверить голосовое"
 BTN_GROUP_ON = "✅ Включить проверку в группе"
 BTN_GROUP_OFF = "⛔ Выключить проверку в группе"
+BTN_HELP_CONNECT = "ℹ️ Как подключить"
+BTN_GROUP_ON_HERE = "✅ Включить проверку здесь"
+BTN_GROUP_OFF_HERE = "⛔ Выключить проверку здесь"
 
-GROUP_SCAN_ENABLED: set[int] = set()
+GROUP_SCAN_ENABLED_USERS: set[int] = set()
+ENABLED_GROUP_CHATS: set[int] = set()
 WAITING_FOR_TEXT_FROM_CHAT: set[int] = set()
 BUSINESS_ALERT_CHAT_CACHE: dict[str, int] = {}
 
@@ -82,6 +86,7 @@ def build_main_keyboard() -> dict[str, Any]:
         "keyboard": [
             [{"text": BTN_CHECK_TEXT}, {"text": BTN_CHECK_VOICE}],
             [{"text": BTN_GROUP_ON}, {"text": BTN_GROUP_OFF}],
+            [{"text": BTN_HELP_CONNECT}],
         ],
         "resize_keyboard": True,
     }
@@ -190,12 +195,35 @@ async def analyze_and_respond_voice(session: aiohttp.ClientSession, chat_id: int
     )
 
 
+
+
+def connection_help_text() -> str:
+    return (
+        "<b>Как подключить бота</b>\n\n"
+        "<b>1) Личный чат:</b> откройте диалог с ботом и используйте кнопки проверки текста/голоса.\n\n"
+        "<b>2) Проверка в группе:</b>\n"
+        "• Добавьте бота в нужную группу.\n"
+        "• Дайте право читать сообщения.\n"
+        "• В группе отправьте кнопку/текст: <i>✅ Включить проверку здесь</i>.\n"
+        "• Для остановки: <i>⛔ Выключить проверку здесь</i>.\n\n"
+        "<b>3) Business-режим:</b> подключите Telegram Business к этому боту. "
+        "Тогда опасные сообщения из личных чатов будут приходить в ваш личный чат с ботом."
+    )
+
+
+def group_keyboard() -> dict[str, Any]:
+    return {
+        "keyboard": [
+            [{"text": BTN_GROUP_ON_HERE}, {"text": BTN_GROUP_OFF_HERE}],
+        ],
+        "resize_keyboard": True,
+    }
 async def handle_private_bot_chat(session: aiohttp.ClientSession, message: dict[str, Any]) -> None:
     chat_id = message["chat"]["id"]
     text = (message.get("text") or "").strip()
     voice = message.get("voice") or message.get("audio")
 
-    if text in {"/start", BTN_CHECK_TEXT, BTN_CHECK_VOICE, BTN_GROUP_ON, BTN_GROUP_OFF}:
+    if text in {"/start", BTN_CHECK_TEXT, BTN_CHECK_VOICE, BTN_GROUP_ON, BTN_GROUP_OFF, BTN_HELP_CONNECT}:
         if text in {"/start", BTN_CHECK_TEXT}:
             WAITING_FOR_TEXT_FROM_CHAT.add(chat_id)
             await send_message(session, chat_id, "Отправьте текст для проверки.", reply_markup=build_main_keyboard())
@@ -204,12 +232,15 @@ async def handle_private_bot_chat(session: aiohttp.ClientSession, message: dict[
             await send_message(session, chat_id, "Отправьте голосовое сообщение для проверки.", reply_markup=build_main_keyboard())
             return
         if text == BTN_GROUP_ON:
-            GROUP_SCAN_ENABLED.add(chat_id)
+            GROUP_SCAN_ENABLED_USERS.add(chat_id)
             await send_message(session, chat_id, "Проверка сообщений в группах включена.", reply_markup=build_main_keyboard())
             return
         if text == BTN_GROUP_OFF:
-            GROUP_SCAN_ENABLED.discard(chat_id)
-            await send_message(session, chat_id, "Проверка сообщений в группах выключена.", reply_markup=build_main_keyboard())
+            GROUP_SCAN_ENABLED_USERS.discard(chat_id)
+            await send_message(session, chat_id, "Глобальный режим проверки групп выключен. Для точной настройки используйте кнопки внутри группы.", reply_markup=build_main_keyboard())
+            return
+        if text == BTN_HELP_CONNECT:
+            await send_message(session, chat_id, connection_help_text(), reply_markup=build_main_keyboard())
             return
 
     if text and chat_id in WAITING_FOR_TEXT_FROM_CHAT:
@@ -233,14 +264,25 @@ async def handle_group_message(session: aiohttp.ClientSession, message: dict[str
     chat_id = chat.get("id")
     if not chat_id:
         return
-    owner_chat_id = message.get("from", {}).get("id")
-    if owner_chat_id not in GROUP_SCAN_ENABLED:
+
+    text = (message.get("text") or "").strip()
+    if text == BTN_GROUP_ON_HERE:
+        ENABLED_GROUP_CHATS.add(chat_id)
+        await send_message(session, chat_id, "Проверка скама включена для этой группы.", reply_markup=group_keyboard())
         return
+    if text == BTN_GROUP_OFF_HERE:
+        ENABLED_GROUP_CHATS.discard(chat_id)
+        await send_message(session, chat_id, "Проверка скама выключена для этой группы.", reply_markup=group_keyboard())
+        return
+
+    if chat_id not in ENABLED_GROUP_CHATS:
+        return
+
     source_label = chat.get("title") or f"group_id={chat_id}"
-    text = message.get("text")
     if text:
         await analyze_and_respond_text(session, chat_id, source_label, text)
         return
+
     voice = message.get("voice") or message.get("audio")
     if voice and voice.get("file_id"):
         try:
